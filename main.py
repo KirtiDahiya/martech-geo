@@ -14,7 +14,7 @@ app = FastAPI(title="GEO Web - Brand Context Intake", version="1.0.0")
 templates = Jinja2Templates(directory="templates")
 
 
-GCS_INPUT_BUCKET = os.environ.get("GCS_INPUT_BUCKET", "Martech/inputs")
+GCS_INPUT_BUCKET = os.environ.get("GCS_INPUT_BUCKET", "geo-inputs")
 DEFAULT_CLIENT_ID = os.environ.get("DEFAULT_CLIENT_ID", "client_001")
 
 def make_run_id() -> str:

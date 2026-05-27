@@ -7,12 +7,10 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from google.cloud import storage
-from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 
 app = FastAPI(title="GEO Web - Brand Context Intake", version="1.0.0")
 templates = Jinja2Templates(directory="templates")
-
 
 GCS_INPUT_BUCKET = os.environ.get("GCS_INPUT_BUCKET", "geo-inputs")
 DEFAULT_CLIENT_ID = os.environ.get("DEFAULT_CLIENT_ID", "client_001")
@@ -21,6 +19,7 @@ def make_run_id() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     suffix = uuid.uuid4().hex[:8]
     return f"run_{timestamp}_{suffix}"
+
 
 def clean_lines(value: str) -> list[str]:
     if not value:
@@ -46,70 +45,80 @@ def bullet_list(value: str) -> str:
     items = clean_lines(value)
     return "\n".join([f"- {item}" for item in items]) if items else "- Not provided"
 
-class BrandContextInput(BaseModel):
-    brand_name: str = Field(..., min_length=2, max_length=200)
-    website_url: HttpUrl
-    industry: str = Field(..., min_length=2, max_length=200)
-    description: str = Field(..., min_length=20, max_length=5000)
-    competitor_list: str = Field(..., min_length=2, max_length=5000)
-    aliases: str = Field(..., min_length=2, max_length=3000)
-    regions: str = Field(..., min_length=2, max_length=3000)
 
-    @field_validator("aliases")
-    @classmethod
-    def validate_aliases(cls, value: str) -> str:
-        if not clean_lines(value):
-            raise ValueError("At least one alias is required.")
-        return value
+def validate_required_text(field_name: str, value: str, min_len: int = 2, max_len: int = 5000) -> str:
+    value = (value or "").strip()
 
-    @field_validator("regions")
-    @classmethod
-    def validate_regions(cls, value: str) -> str:
-        if not clean_lines(value):
-            raise ValueError("At least one region is required.")
-        return value
+    if len(value) < min_len:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} is required and must be at least {min_len} characters.",
+        )
 
-    @field_validator("competitor_list")
-    @classmethod
-    def validate_competitors(cls, value: str) -> str:
-        if not clean_lines(value):
-            raise ValueError("At least one competitor is required.")
-        return value
+    if len(value) > max_len:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must not exceed {max_len} characters.",
+        )
+
+    return value
 
 
-def build_brand_context_md(data: BrandContextInput) -> str:
-    """
-    Creates clean brand_context.md.
+def validate_url(value: str) -> str:
+    value = validate_required_text("Website URL", value, min_len=5, max_len=1000)
 
-    Important:
-    - No client_id
-    - No run_id
-    - No platform metadata
-    - Only business context fields and deterministic sections
-    """
+    if not (value.startswith("http://") or value.startswith("https://")):
+        raise HTTPException(
+            status_code=400,
+            detail="Website URL must start with http:// or https://",
+        )
 
+    return value
+
+
+def validate_list_field(field_name: str, value: str) -> str:
+    value = validate_required_text(field_name, value, min_len=2, max_len=5000)
+
+    if not clean_lines(value):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must contain at least one value.",
+        )
+
+    return value
+
+
+def build_brand_context_md(
+    brand_name: str,
+    website_url: str,
+    industry: str,
+    description: str,
+    competitor_list: str,
+    aliases: str,
+    regions: str,
+) -> str:
     return f"""# Brand Context
 
 ## Brand Name
-{data.brand_name}
+{brand_name}
 
 ## Website URL
-{data.website_url}
+{website_url}
 
 ## Industry
-{data.industry}
+{industry}
 
 ## Description
-{data.description}
+{description}
 
 ## Competitor List
-{bullet_list(data.competitor_list)}
+{bullet_list(competitor_list)}
 
 ## Aliases
-{bullet_list(data.aliases)}
+{bullet_list(aliases)}
 
 ## Regions
-{bullet_list(data.regions)}
+{bullet_list(regions)}
 """
 
 
@@ -152,31 +161,27 @@ def create_brand_context(
     aliases: str = Form(...),
     regions: str = Form(...),
 ):
-    """
-    Receives form fields, creates brand_context.md, and uploads it to GCS.
+    brand_name = validate_required_text("Brand Name", brand_name, min_len=2, max_len=200)
+    website_url = validate_url(website_url)
+    industry = validate_required_text("Industry", industry, min_len=2, max_len=200)
+    description = validate_required_text("Description", description, min_len=20, max_len=5000)
+    competitor_list = validate_list_field("Competitor List", competitor_list)
+    aliases = validate_list_field("Aliases", aliases)
+    regions = validate_list_field("Regions", regions)
 
-    Stored path:
-    gs://<GCS_INPUT_BUCKET>/<client_id>/<run_id>/brand_context.md
-    """
-
-    try:
-        data = BrandContextInput(
-            brand_name=brand_name,
-            website_url=website_url,
-            industry=industry,
-            description=description,
-            competitor_list=competitor_list,
-            aliases=aliases,
-            regions=regions,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    # client_id is only used in storage path, not inside brand_context.md.
     safe_client_id = re.sub(r"[^a-zA-Z0-9_-]", "_", client_id.strip() or DEFAULT_CLIENT_ID)
     run_id = make_run_id()
 
-    brand_context_md = build_brand_context_md(data)
+    brand_context_md = build_brand_context_md(
+        brand_name=brand_name,
+        website_url=website_url,
+        industry=industry,
+        description=description,
+        competitor_list=competitor_list,
+        aliases=aliases,
+        regions=regions,
+    )
+
     object_path = f"{safe_client_id}/{run_id}/brand_context.md"
 
     upload_text_to_gcs(
@@ -210,14 +215,22 @@ def preview_brand_context(
     aliases: str = Form(...),
     regions: str = Form(...),
 ):
-    data = BrandContextInput(
-        brand_name=brand_name,
-        website_url=website_url,
-        industry=industry,
-        description=description,
-        competitor_list=competitor_list,
-        aliases=aliases,
-        regions=regions,
-    )
+    brand_name = validate_required_text("Brand Name", brand_name, min_len=2, max_len=200)
+    website_url = validate_url(website_url)
+    industry = validate_required_text("Industry", industry, min_len=2, max_len=200)
+    description = validate_required_text("Description", description, min_len=20, max_len=5000)
+    competitor_list = validate_list_field("Competitor List", competitor_list)
+    aliases = validate_list_field("Aliases", aliases)
+    regions = validate_list_field("Regions", regions)
 
-    return {"brand_context_md": build_brand_context_md(data)}
+    return {
+        "brand_context_md": build_brand_context_md(
+            brand_name=brand_name,
+            website_url=website_url,
+            industry=industry,
+            description=description,
+            competitor_list=competitor_list,
+            aliases=aliases,
+            regions=regions,
+        )
+    }
